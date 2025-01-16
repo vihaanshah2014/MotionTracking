@@ -1,202 +1,230 @@
 import cv2
 import mediapipe as mp
-import math
 import time
+import math
+from collections import deque
 
-# Initialize MediaPipe
+# -------------------------- 1. Setup Holistic & Drawing --------------------------
+mp_holistic = mp.solutions.holistic
 mp_drawing = mp.solutions.drawing_utils
-mp_pose = mp.solutions.pose
 
-def calculate_angle(a, b, c):
-    """
-    Calculate the angle (in degrees) formed by the points A, B, C
-    with B as the vertex (e.g., shoulder -> elbow -> wrist).
-    
-    a, b, c are (x, y) coordinates in 2D.
-    """
-    # Convert them to vectors: BA and BC
-    ba = (a[0] - b[0], a[1] - b[1])
-    bc = (c[0] - b[0], c[1] - b[1])
-    
-    # Dot product and magnitude
-    dot_prod = ba[0]*bc[0] + ba[1]*bc[1]
-    mag_ba = math.sqrt(ba[0]**2 + ba[1]**2)
-    mag_bc = math.sqrt(bc[0]**2 + bc[1]**2)
+# For optional drawing styles (e.g., face keypoints in different colors)
+mp_drawing_styles = mp.solutions.drawing_styles
 
-    # Avoid division by zero
+# We'll track the wrist positions over time to compute velocity
+# Deques store the last few frames of (x, y, t) for each wrist
+left_wrist_history = deque(maxlen=10)
+right_wrist_history = deque(maxlen=10)
+
+# Utility function to compute velocity from position history
+def compute_velocity(history_deque):
+    """
+    Given a deque of (x, y, timestamp) for the last frames,
+    compute approximate 2D velocity (pixels/sec).
+    """
+    if len(history_deque) < 2:
+        return 0.0, 0.0
+    
+    # Compare the latest point with an older point
+    x1, y1, t1 = history_deque[0]
+    x2, y2, t2 = history_deque[-1]
+    dt = t2 - t1
+    if dt == 0:
+        return 0.0, 0.0
+    vx = (x2 - x1) / dt
+    vy = (y2 - y1) / dt
+    return vx, vy
+
+# A quick helper to compute a 2D angle between three points (A-B-C) at B
+def angle_2d(ax, ay, bx, by, cx, cy):
+    """
+    Returns the angle (in degrees) formed by points A, B, C
+    with B as the vertex.
+    """
+    BA = (ax - bx, ay - by)
+    BC = (cx - bx, cy - by)
+    dot_prod = BA[0]*BC[0] + BA[1]*BC[1]
+    mag_ba = math.sqrt(BA[0]**2 + BA[1]**2)
+    mag_bc = math.sqrt(BC[0]**2 + BC[1]**2)
     if mag_ba == 0 or mag_bc == 0:
         return 0.0
-
-    # Angle in radians
     cos_angle = dot_prod / (mag_ba * mag_bc)
-    # Numerical safety for floating precision
+    # clamp cos_angle to [-1,1] to avoid floating precision errors
     cos_angle = max(min(cos_angle, 1.0), -1.0)
+    return math.degrees(math.acos(cos_angle))
 
-    angle = math.degrees(math.acos(cos_angle))
-    return angle
-
+# -------------------------- 2. Main Loop --------------------------
 def main():
     cap = cv2.VideoCapture(0)
-    
-    # For counting reps or partial reps
-    stage = None  # "up" or "down"
-    rep_count = 0
+    if not cap.isOpened():
+        print("Cannot access webcam.")
+        return
 
-    # For FPS
-    prev_time = time.time()
-
-    with mp_pose.Pose(
+    # Create a Holistic object. Setting refine_face_landmarks=True for better face tracking
+    with mp_holistic.Holistic(
         static_image_mode=False,
         model_complexity=1,
         smooth_landmarks=True,
-        enable_segmentation=False,
+        refine_face_landmarks=True,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5
-    ) as pose:
-        
+    ) as holistic:
+
+        prev_time = time.time()
+
         while True:
             success, frame = cap.read()
             if not success:
                 print("Ignoring empty camera frame.")
                 continue
 
-            # Flip the image horizontally for a later selfie-view display
+            # Flip horizontally for a later selfie-view display
             frame = cv2.flip(frame, 1)
+            h, w, c = frame.shape
 
-            # Convert the image to RGB
-            image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = pose.process(image_rgb)
+            # Convert the BGR image to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            # Collect data points
-            data_points = {}  # e.g., {"shoulder": (x,y), "elbow": (x,y), ...}
+            # Process the frame with MediaPipe Holistic
+            results = holistic.process(frame_rgb)
 
+            # ---------------------- 2A. Drawing Landmarks ----------------------
+            # Draw pose, face and hands landmarks on the BGR frame (in-place)
+            mp_drawing.draw_landmarks(
+                frame,
+                results.pose_landmarks,
+                mp_holistic.POSE_CONNECTIONS,
+                landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style(),
+                connection_drawing_spec=mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=1)
+            )
+            mp_drawing.draw_landmarks(
+                frame,
+                results.face_landmarks,
+                mp.solutions.face_mesh.FACEMESH_CONTOURS,
+                landmark_drawing_spec=mp_drawing_styles.get_default_face_mesh_tesselation_style(),
+                connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_contours_style()
+            )
+            mp_drawing.draw_landmarks(
+                frame,
+                results.left_hand_landmarks,
+                mp_holistic.HAND_CONNECTIONS,
+                landmark_drawing_spec=mp_drawing_styles.get_default_hand_landmarks_style(),
+                connection_drawing_spec=mp_drawing_styles.get_default_hand_connections_style()
+            )
+            mp_drawing.draw_landmarks(
+                frame,
+                results.right_hand_landmarks,
+                mp_holistic.HAND_CONNECTIONS,
+                landmark_drawing_spec=mp_drawing_styles.get_default_hand_landmarks_style(),
+                connection_drawing_spec=mp_drawing_styles.get_default_hand_connections_style()
+            )
+
+            # ---------------------- 2B. Compute Metrics (Head Turn, Back Alignment, etc.) ----------------------
+            # We'll gather some data in a dictionary to print each frame
+            data_dict = {}
+
+            # 1) Head Turn Angle:
+            #    We can approximate by using face landmarks, e.g. left ear & right ear & nose,
+            #    or we can use pose landmarks for left/right ear (index 7,8).
+            #    If using face_landmarks, we might pick certain points. Let's do pose for simplicity: 
+            #       7: left_ear, 8: right_ear, 0: nose
             if results.pose_landmarks:
-                # Get image dims
-                h, w, _ = frame.shape
+                poseLms = results.pose_landmarks.landmark
+                if len(poseLms) > 8:
+                    # We'll do an angle at the nose: (left_ear -> nose -> right_ear)
+                    left_ear = poseLms[7]
+                    right_ear = poseLms[8]
+                    nose = poseLms[0]
+                    # Convert to pixel coords
+                    lx, ly = left_ear.x * w, left_ear.y * h
+                    rx, ry = right_ear.x * w, right_ear.y * h
+                    nx, ny = nose.x * w, nose.y * h
+                    head_angle = angle_2d(lx, ly, nx, ny, rx, ry)
+                    data_dict["HeadTurn(deg)"] = round(head_angle, 2)
 
-                # Extract pose landmarks
-                landmarks = results.pose_landmarks.landmark
+            # 2) Back Alignment:
+            #    Let's approximate with shoulders vs. hips alignment (pose indices: 11=left_shoulder, 12=right_shoulder, 23=left_hip, 24=right_hip).
+            #    We'll compute angle at shoulders or overall tilt vs. vertical.
+            if results.pose_landmarks:
+                lm = results.pose_landmarks.landmark
+                if len(lm) > 24:
+                    # We'll do an angle between the line (left_shoulder -> right_shoulder) and (left_hip -> right_hip)
+                    ls = lm[11]  # left_shoulder
+                    rs = lm[12]  # right_shoulder
+                    lh = lm[23]  # left_hip
+                    rh = lm[24]  # right_hip
 
-                # MediaPipe Pose indices (Right arm for example)
-                #   12 - right shoulder
-                #   14 - right elbow
-                #   16 - right wrist
-                #   24 - right hip
-                #   11 - left shoulder (for torso angle reference)
-                #   23 - left hip (for torso angle reference)
+                    # midpoint of shoulders
+                    msx = (ls.x + rs.x) / 2 * w
+                    msy = (ls.y + rs.y) / 2 * h
+                    # midpoint of hips
+                    mhx = (lh.x + rh.x) / 2 * w
+                    mhy = (lh.y + rh.y) / 2 * h
 
-                # We only focus on right side for the bicep:
-                right_shoulder = landmarks[12]
-                right_elbow = landmarks[14]
-                right_wrist = landmarks[16]
-                right_hip = landmarks[24]
+                    # We'll measure the angle between the vertical line and the line from mid-hip to mid-shoulders
+                    # Let's define a "vertical" point above mid-hip
+                    topx, topy = mhx, mhy - 100  # 100 pixels above hips
+                    back_angle = angle_2d(topx, topy, mhx, mhy, msx, msy)
+                    data_dict["BackAlignment(deg)"] = round(back_angle, 2)
 
-                # Left side for checking torso angle (optional):
-                left_shoulder = landmarks[11]
-                left_hip = landmarks[23]
-
-                # Convert normalized coordinates [0,1] to pixel values
-                r_shoulder_xy = (right_shoulder.x * w, right_shoulder.y * h)
-                r_elbow_xy = (right_elbow.x * w, right_elbow.y * h)
-                r_wrist_xy = (right_wrist.x * w, right_wrist.y * h)
-                r_hip_xy = (right_hip.x * w, right_hip.y * h)
-                
-                l_shoulder_xy = (left_shoulder.x * w, left_shoulder.y * h)
-                l_hip_xy = (left_hip.x * w, left_hip.y * h)
-
-                data_points["right_shoulder"] = r_shoulder_xy
-                data_points["right_elbow"] = r_elbow_xy
-                data_points["right_wrist"] = r_wrist_xy
-                data_points["right_hip"] = r_hip_xy
-                data_points["left_shoulder"] = l_shoulder_xy
-                data_points["left_hip"] = l_hip_xy
-
-                # ---------------------------
-                # 1. Calculate Elbow Angle
-                # ---------------------------
-                # Angle at the elbow: (shoulder -> elbow -> wrist)
-                elbow_angle = calculate_angle(r_shoulder_xy, r_elbow_xy, r_wrist_xy)
-
-                # ---------------------------
-                # 2. Calculate Torso Angle
-                # ---------------------------
-                # For simplicity, let's look at the angle of the spine (shoulder -> hip)
-                # We'll do right side or we can do average of left & right
-                # Right side: (shoulder -> hip -> horizontal reference)
-                # But simpler approach is to compare left and right shoulders vs hips to see if torso is vertical
-                # Let's do angle between left_shoulder and right_shoulder, and left_hip and right_hip:
-                # Actually, let's do a simpler approach: angle between shoulders and hips for "lean".
-                torso_angle = calculate_angle(l_shoulder_xy, r_shoulder_xy, r_hip_xy)  # This is a rough approach
-                # (Alternatively, you might measure the angle between the vector from left_hip to right_hip 
-                # and left_shoulder to right_shoulder, or compare it to a horizontal line.)
-
-                # ---------------------------
-                # 3. Infer Bicep Curl Progress
-                # ---------------------------
-                # Typical full extension is ~160-180 degrees at the elbow, 
-                # full flexion is ~30-60 degrees. We'll do a rough approach:
-                full_extension_angle = 160.0
-                full_flexion_angle   = 60.0
-                # Clip the angle to our range
-                clipped_angle = max(min(elbow_angle, full_extension_angle), full_flexion_angle)
-                # 0% = fully extended, 100% = fully flexed
-                curl_percent = (
-                    (full_extension_angle - clipped_angle) / 
-                    (full_extension_angle - full_flexion_angle) * 100
-                )
-                curl_percent = round(curl_percent, 1)
-
-                # ---------------------------
-                # 4. Rep Counting Logic
-                # ---------------------------
-                # If elbow_angle > ~150 => arm is "down"
-                # If elbow_angle < ~70 => arm is "up"
-                if elbow_angle > 150:
-                    stage = "down"
-                if elbow_angle < 70 and stage == "down":
-                    stage = "up"
-                    rep_count += 1
-
-                # ---------------------------
-                # 5. Display Data on Screen
-                # ---------------------------
-                # Draw pose landmarks
-                mp_drawing.draw_landmarks(
-                    frame,
-                    results.pose_landmarks,
-                    mp_pose.POSE_CONNECTIONS
-                )
-
-                # Display elbow angle
-                cv2.putText(frame, f'Elbow Angle: {int(elbow_angle)} deg',
-                            (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                # Display curl progress
-                cv2.putText(frame, f'Curl: {curl_percent}%',
-                            (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                # Display torso angle (roughly)
-                cv2.putText(frame, f'Torso Angle (approx): {int(torso_angle)} deg',
-                            (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                # Display rep count
-                cv2.putText(frame, f'Reps: {rep_count}',
-                            (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
-                # (Optional) Log the data points
-                # For demonstration, print them out (you could also write to CSV or store in memory)
-                print("-- Data Points --")
-                for k, v in data_points.items():
-                    print(f"{k}: {v}")
-                print(f"Elbow Angle: {elbow_angle}, Torso Angle: {torso_angle}, Curl%: {curl_percent}, Reps: {rep_count}")
-                print("-----------------\n")
-
-            # Calculate and display FPS
+            # 3) Wrist Movement:
+            #    We'll track left wrist (pose idx 15) and right wrist (16) positions in a history to compute velocity.
+            #    If you want finger-based wrist, you can also get them from the hand solution (landmark 0 in that).
             curr_time = time.time()
-            fps = 1 / (curr_time - prev_time) if (curr_time - prev_time) != 0 else 0
-            prev_time = curr_time
-            cv2.putText(frame, f'FPS: {int(fps)}',
-                        (20, 170), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            if results.pose_landmarks:
+                lm = results.pose_landmarks.landmark
+                # left wrist idx=15, right wrist idx=16
+                if len(lm) > 16:
+                    lw = lm[15]
+                    rw = lm[16]
+                    lwx, lwy = lw.x * w, lw.y * h
+                    rwx, rwy = rw.x * w, rw.y * h
 
-            cv2.imshow("Biceps Curl Tracking", frame)
-            if cv2.waitKey(1) & 0xFF == 27:  # ESC key to exit
+                    # Append to history
+                    left_wrist_history.append((lwx, lwy, curr_time))
+                    right_wrist_history.append((rwx, rwy, curr_time))
+
+                    # Compute velocity
+                    lvx, lvy = compute_velocity(left_wrist_history)
+                    rvx, rvy = compute_velocity(right_wrist_history)
+                    data_dict["LeftWristVel(px/s)"] = (round(lvx,1), round(lvy,1))
+                    data_dict["RightWristVel(px/s)"] = (round(rvx,1), round(rvy,1))
+
+            # 4) Finger Placement:
+            #    We can track each hand in detail from results.left_hand_landmarks, results.right_hand_landmarks
+            #    Each has 21 landmarks. We'll just print their coordinates or do some logic if you want.
+            #    Landmark indexing for hands: 0=wrist, 4=thumb tip, 8=index tip, etc.
+            #    We'll store them in data_dict
+            if results.left_hand_landmarks:
+                left_hand_points = []
+                for i, mark in enumerate(results.left_hand_landmarks.landmark):
+                    xh, yh = mark.x * w, mark.y * h
+                    left_hand_points.append((i, round(xh,1), round(yh,1)))
+                data_dict["LeftHandFingers"] = left_hand_points
+
+            if results.right_hand_landmarks:
+                right_hand_points = []
+                for i, mark in enumerate(results.right_hand_landmarks.landmark):
+                    xh, yh = mark.x * w, mark.y * h
+                    right_hand_points.append((i, round(xh,1), round(yh,1)))
+                data_dict["RightHandFingers"] = right_hand_points
+
+            # ---------------------- 2C. Display & Print Data ----------------------
+            # Show the data on console each frame
+            print("---- Frame Data ----")
+            for k, v in data_dict.items():
+                print(f"{k}: {v}")
+            print("--------------------\n")
+
+            # Optionally overlay some text on the frame
+            cv2.putText(frame, f"HeadAngle: {data_dict.get('HeadTurn(deg)',0):.2f}", (10,30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+            cv2.putText(frame, f"BackAngle: {data_dict.get('BackAlignment(deg)',0):.2f}", (10,60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+
+            # Show the final frame
+            cv2.imshow("Holistic Tracking", frame)
+            if cv2.waitKey(1) & 0xFF == 27:  # ESC to exit
                 break
 
     cap.release()
