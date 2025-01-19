@@ -3,6 +3,7 @@ import mediapipe as mp
 import time
 import math
 from collections import deque
+import numpy as np
 
 mp_holistic = mp.solutions.holistic
 mp_drawing = mp.solutions.drawing_utils
@@ -10,6 +11,16 @@ mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
 left_wrist_history = deque(maxlen=10)
 right_wrist_history = deque(maxlen=10)
+
+# Add these constants near the top after the imports
+TENSION_MEMORY = 50  # How many frames to remember for tension buildup
+muscle_tension = {
+    'left_arm': deque([0]*TENSION_MEMORY, maxlen=TENSION_MEMORY),
+    'right_arm': deque([0]*TENSION_MEMORY, maxlen=TENSION_MEMORY),
+    'neck': deque([0]*TENSION_MEMORY, maxlen=TENSION_MEMORY),
+    'spine': deque([0]*TENSION_MEMORY, maxlen=TENSION_MEMORY)
+}
+
 def compute_velocity(history_deque):
     """
     Given a deque of (x, y, timestamp) for the last frames,
@@ -49,6 +60,27 @@ def compute_angle_vertical(x1, y1, x2, y2):
     """
     vertical = (x1, y1 - 100) 
     return angle_2d(vertical[0], vertical[1], x1, y1, x2, y2)
+
+def calculate_tension(angles, velocities):
+    """
+    Calculate muscle tension based on joint angles and movement velocity
+    Returns a value between 0 and 1
+    """
+    # Normalize angles and velocities to contribute to tension
+    angle_factor = min(max(abs(angles) / 90.0, 0), 1)  # Assumes 90 degrees is max tension
+    velocity_factor = min(abs(velocities) / 100.0, 1)  # Assumes 100 pixels/sec is max tension
+    return (angle_factor + velocity_factor) / 2
+
+def get_color_for_tension(base_color, tension):
+    """
+    Transition color from green (low tension) to red (high tension)
+    tension: value between 0-1
+    Returns: BGR color tuple
+    """
+    # Linear interpolation from green (0, 255, 0) to red (0, 0, 255)
+    green = int(255 * (1 - tension))
+    red = int(255 * tension)
+    return (0, green, red)
 
 def main():
     cap = cv2.VideoCapture(0)
@@ -154,6 +186,74 @@ def main():
                         (neck_mid[1] - hip_mid[1])**2
                     ) * h
                     data_dict["SpineLength(px)"] = round(spine_length, 2)
+
+                    # Calculate tensions
+                    current_time = time.time()
+                    
+                    # Left arm tension
+                    left_arm_tension = calculate_tension(
+                        left_elbow_angle,
+                        compute_velocity(left_wrist_history)[0]
+                    )
+                    muscle_tension['left_arm'].append(left_arm_tension)
+                    
+                    # Right arm tension
+                    right_arm_tension = calculate_tension(
+                        right_elbow_angle,
+                        compute_velocity(right_wrist_history)[0]
+                    )
+                    muscle_tension['right_arm'].append(right_arm_tension)
+                    
+                    # Neck tension
+                    neck_tension = calculate_tension(neck_angle, 0)
+                    muscle_tension['neck'].append(neck_tension)
+                    
+                    # Draw enhanced body mesh with tension colors
+                    # Torso mesh
+                    torso_points = np.array([
+                        [l_shoulder.x * w, l_shoulder.y * h],
+                        [r_shoulder.x * w, r_shoulder.y * h],
+                        [r_hip.x * w, r_hip.y * h],
+                        [l_hip.x * w, l_hip.y * h]
+                    ], np.int32)
+                    
+                    cv2.fillPoly(frame, [torso_points], 
+                                get_color_for_tension((0, 255, 0), 
+                                sum(muscle_tension['spine'])/len(muscle_tension['spine'])))
+                    
+                    # Left arm mesh
+                    left_arm_color = get_color_for_tension(
+                        (0, 255, 0),
+                        sum(muscle_tension['left_arm'])/len(muscle_tension['left_arm'])
+                    )
+                    cv2.line(frame, 
+                            (int(l_shoulder.x * w), int(l_shoulder.y * h)),
+                            (int(l_elbow.x * w), int(l_elbow.y * h)),
+                            left_arm_color, 8)
+                    cv2.line(frame,
+                            (int(l_elbow.x * w), int(l_elbow.y * h)),
+                            (int(l_wrist.x * w), int(l_wrist.y * h)),
+                            left_arm_color, 8)
+                    
+                    # Right arm mesh
+                    right_arm_color = get_color_for_tension(
+                        (0, 255, 0),
+                        sum(muscle_tension['right_arm'])/len(muscle_tension['right_arm'])
+                    )
+                    cv2.line(frame,
+                            (int(r_shoulder.x * w), int(r_shoulder.y * h)),
+                            (int(r_elbow.x * w), int(r_elbow.y * h)),
+                            right_arm_color, 8)
+                    cv2.line(frame,
+                            (int(r_elbow.x * w), int(r_elbow.y * h)),
+                            (int(r_wrist.x * w), int(r_wrist.y * h)),
+                            right_arm_color, 8)
+
+                    # Add tension values to data_dict
+                    data_dict["LeftArmTension"] = round(sum(muscle_tension['left_arm'])/len(muscle_tension['left_arm']), 2)
+                    data_dict["RightArmTension"] = round(sum(muscle_tension['right_arm'])/len(muscle_tension['right_arm']), 2)
+                    data_dict["NeckTension"] = round(sum(muscle_tension['neck'])/len(muscle_tension['neck']), 2)
+
             y_pos = 30
             for key, value in data_dict.items():
                 if isinstance(value, tuple):
